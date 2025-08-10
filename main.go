@@ -23,11 +23,18 @@ import (
 	"fyne.io/fyne/v2/widget"
 )
 
-// ----- State -----
+// TileCache ----- State -----
+type TileCache struct {
+	mu sync.RWMutex
+	m  map[string]image.Image
+}
+
 type AppState struct {
 	CenterLon, CenterLat float64
+	Zoom                 int // ADDED: The map's zoom level
 	Crimes               []CrimePoint
-	mu                   sync.RWMutex // Added a mutex for safe concurrent access
+	mu                   sync.RWMutex
+	tileCache            *TileCache // ADDED: A pointer to the tile cache
 }
 
 type CrimePoint struct {
@@ -173,22 +180,32 @@ func fetchCrimes(ctx context.Context, lon, lat float64, yyyymm string) ([]CrimeP
 }
 
 // ----- Render helpers -----
-func drawCrimes(img *image.RGBA, w, h int, centerLon, centerLat float64, crimes []CrimePoint) {
+func drawCrimes(img *image.RGBA, w, h int, centerLon, centerLat float64, zoom int, crimes []CrimePoint) {
 	if len(crimes) == 0 {
 		return
 	}
 	cx, cy := w/2, h/2
 
+	// The number of pixels for 360 degrees of longitude at the equator for a given zoom level
+	// is 256 * (2^zoom). We use this to calculate a dynamic scaling factor.
+	pixelsPer360Deg := 256.0 * math.Pow(2, float64(zoom))
+	pixelsPerDegLon := pixelsPer360Deg / 360.0
+
+	// Latitude scaling is adjusted by the cosine of the latitude
+	pixelsPerDegLat := pixelsPerDegLon * math.Cos(centerLat*math.Pi/180)
+
 	for _, c := range crimes {
 		dxDeg := c.Lon - centerLon
 		dyDeg := c.Lat - centerLat
-		py := cy - int(dyDeg*20000.0)
-		px := cx + int(dxDeg*20000.0*math.Cos(centerLat*math.Pi/180))
+		px := cx + int(dxDeg*pixelsPerDegLon)
+		py := cy - int(dyDeg*pixelsPerDegLat) // Y is inverted in screen coordinates
 
-		for y := -3; y <= 3; y++ {
-			for x := -3; x <= 3; x++ {
-				if x*x+y*y <= 9 {
-					X, Y := px+x, py+y
+		// Draw a small red circle for the crime
+		radius := 4
+		for yOff := -radius; yOff <= radius; yOff++ {
+			for xOff := -radius; xOff <= radius; xOff++ {
+				if xOff*xOff+yOff*yOff <= radius*radius {
+					X, Y := px+xOff, py+yOff
 					if image.Pt(X, Y).In(img.Bounds()) {
 						img.Set(X, Y, color.RGBA{R: 200, G: 0, B: 0, A: 220})
 					}
@@ -198,34 +215,142 @@ func drawCrimes(img *image.RGBA, w, h int, centerLon, centerLat float64, crimes 
 	}
 }
 
+// converts longitude and latitude to floating-point tile numbers at a given zoom.
+func lonLatToTile(lon, lat float64, zoom int) (x, y float64) {
+	latRad := lat * math.Pi / 180
+	n := math.Pow(2, float64(zoom))
+	x = (lon + 180.0) / 360.0 * n
+	y = (1.0 - math.Log(math.Tan(latRad)+1.0/math.Cos(latRad))/math.Pi) / 2.0 * n
+	return x, y
+}
+
+func getTile(z, x, y int) image.Image {
+	// Create a unique key for this tile
+	tileKey := fmt.Sprintf("%d/%d/%d", z, x, y)
+
+	// Check the cache first (with a read lock)
+	st.tileCache.mu.RLock()
+	img, found := st.tileCache.m[tileKey]
+	st.tileCache.mu.RUnlock()
+	if found {
+		return img
+	}
+
+	// Not in cache, download it.
+	// Set a valid User-Agent per OpenStreetMap policy.
+	url := fmt.Sprintf("https://tile.openstreetmap.org/%s.png", tileKey)
+	client := &http.Client{}
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", "AronG-CrimeMapper/0.1")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Failed to download tile %s: %v", tileKey, err)
+		return nil // Or return a placeholder "error" image
+	}
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+
+		}
+	}(resp.Body)
+
+	img, _, err = image.Decode(resp.Body)
+	if err != nil {
+		log.Printf("Failed to decode tile %s: %v", tileKey, err)
+		return nil // Or return a placeholder "error" image
+	}
+
+	// Add the newly downloaded image to the cache (with a write lock)
+	st.tileCache.mu.Lock()
+	st.tileCache.m[tileKey] = img
+	st.tileCache.mu.Unlock()
+
+	return img
+}
+
 // ----- Main -----
 func main() {
+	st = AppState{
+		Zoom: 14, // A good default zoom level for a city
+		tileCache: &TileCache{
+			m: make(map[string]image.Image),
+		},
+	}
+
 	a := app.NewWithID("com.arong.crimemapper")
 	w := a.NewWindow("Community Data Visualiser")
 	w.Resize(fyne.NewSize(1100, 700))
 
 	// Map canvas first so closures can capture it
 	var mapCanvas *canvas.Raster
-	mapCanvas = canvas.NewRaster(func(wd, ht int) image.Image {
-		img := image.NewRGBA(image.Rect(0, 0, wd, ht))
-		draw.Draw(img, img.Bounds(), &image.Uniform{C: color.RGBA{R: 245, G: 245, B: 245, A: 255}}, image.Point{}, draw.Src)
+	mapCanvas = canvas.NewRaster(func(w, h int) image.Image {
+		// Create the image we will draw on
+		img := image.NewRGBA(image.Rect(0, 0, w, h))
 
-		// Use a read-lock to safely access state for drawing
+		// Get a read-lock on the state for consistent values during this draw cycle
 		st.mu.RLock()
-		defer st.mu.RUnlock()
+		zoom := st.Zoom
+		centerLon := st.CenterLon
+		centerLat := st.CenterLat
+		crimes := st.Crimes
+		st.mu.RUnlock()
 
-		// crosshair
-		cx, cy := wd/2, ht/2
-		if st.CenterLon != 0 { // Only draw crosshair if a center is set
-			for dx := -6; dx <= 6; dx++ {
-				img.Set(cx+dx, cy, color.RGBA{A: 255})
-			}
-			for dy := -6; dy <= 6; dy++ {
-				img.Set(cx, cy+dy, color.RGBA{A: 255})
+		if centerLon == 0 && centerLat == 0 {
+			// Don't draw a map if no location is set. Just draw a message.
+			draw.Draw(img, img.Bounds(), &image.Uniform{C: color.RGBA{R: 240, G: 240, B: 240, A: 255}}, image.Point{}, draw.Src)
+			return img // Return early
+		}
+
+		// 1. Convert our map's center Lon/Lat to a floating-point tile coordinate
+		centerXTile, centerYTile := lonLatToTile(centerLon, centerLat, zoom)
+
+		// 2. Calculate the top-left tile we need to start drawing from
+		// The center of the screen in pixels is (w/2, h/2)
+		// The center of the map in tile units is (centerXTile, centerYTile)
+		// We calculate the top-left of the screen in tile units
+		startTileX := centerXTile - (float64(w)/2)/256.0
+		startTileY := centerYTile - (float64(h)/2)/256.0
+
+		// 3. Loop to draw all visible tiles
+		// We iterate from the start tile to fill the whole screen width and height
+		for y := 0.0; y < float64(h); y += 256.0 {
+			for x := 0.0; x < float64(w); x += 256.0 {
+				// Calculate which tile (integer) corresponds to this screen pixel
+				tileX := int(math.Floor(startTileX + x/256.0))
+				tileY := int(math.Floor(startTileY + y/256.0))
+
+				// Fetch the tile from our cache/downloader
+				tileImg := getTile(zoom, tileX, tileY)
+				if tileImg != nil {
+					// Calculate exactly where on our canvas to draw this tile
+					// This accounts for the fractional part of our startTile coordinates
+					drawX := int(math.Round((float64(tileX) - startTileX) * 256.0))
+					drawY := int(math.Round((float64(tileY) - startTileY) * 256.0))
+
+					// Draw the tile onto our main image
+					draw.Draw(img, image.Rect(drawX, drawY, drawX+256, drawY+256), tileImg, image.Point{}, draw.Src)
+				}
 			}
 		}
-		// crimes overlay
-		drawCrimes(img, wd, ht, st.CenterLon, st.CenterLat, st.Crimes)
+
+		// 4. Draw overlays (crosshair and crimes) on top of the map
+		// The logic for drawing crimes now needs the zoom level to scale correctly
+		drawCrimes(img, w, h, centerLon, centerLat, zoom, crimes)
+
+		// Draw the crosshair
+		cx, cy := w/2, h/2
+		for dx := -8; dx <= 8; dx++ {
+			img.Set(cx+dx, cy, color.Black)
+			img.Set(cx+dx, cy-1, color.White)
+			img.Set(cx+dx, cy+1, color.White)
+		}
+		for dy := -8; dy <= 8; dy++ {
+			img.Set(cx, cy+dy, color.Black)
+			img.Set(cx-1, cy+dy, color.White)
+			img.Set(cx+1, cy+dy, color.White)
+		}
+
 		return img
 	})
 
