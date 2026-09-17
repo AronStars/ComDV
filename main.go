@@ -31,10 +31,10 @@ type TileCache struct {
 
 type AppState struct {
 	CenterLon, CenterLat float64
-	Zoom                 int // ADDED: The map's zoom level
+	Zoom                 int
 	Crimes               []CrimePoint
 	mu                   sync.RWMutex
-	tileCache            *TileCache // ADDED: A pointer to the tile cache
+	tileCache            *TileCache
 }
 
 type CrimePoint struct {
@@ -43,6 +43,7 @@ type CrimePoint struct {
 }
 
 var st AppState
+var activeDownloads sync.Map // track which tiles are currently downloading
 
 // ----- API types -----
 type postcodeIOResp struct {
@@ -51,6 +52,52 @@ type postcodeIOResp struct {
 		Latitude  float64 `json:"latitude"`
 		Longitude float64 `json:"longitude"`
 	} `json:"result"`
+}
+
+// ----- Interactive Map Widget -----
+type mapWidget struct {
+	widget.BaseWidget
+	raster *canvas.Raster
+}
+
+func (m *mapWidget) CreateRenderer() fyne.WidgetRenderer {
+	return widget.NewSimpleRenderer(m.raster)
+}
+
+func (m *mapWidget) Dragged(e *fyne.DragEvent) {
+	st.mu.Lock()
+	zoom := st.Zoom
+	currentLat := st.CenterLat
+	st.mu.Unlock()
+
+	pixelsPer360Deg := 256.0 * math.Pow(2, float64(zoom))
+	degPerPixelLon := 360.0 / pixelsPer360Deg
+	degPerPixelLat := degPerPixelLon * math.Cos(currentLat*math.Pi/180)
+
+	st.mu.Lock()
+	st.CenterLon -= float64(e.Dragged.DX) * degPerPixelLon
+	st.CenterLat += float64(e.Dragged.DY) * degPerPixelLat
+	st.mu.Unlock()
+
+	canvas.Refresh(m.raster)
+}
+
+func (m *mapWidget) DragEnd() {}
+
+func (m *mapWidget) Scrolled(e *fyne.ScrollEvent) {
+	st.mu.Lock()
+	if e.Scrolled.DY > 0 {
+		if st.Zoom < 19 {
+			st.Zoom++
+		}
+	} else if e.Scrolled.DY < 0 {
+		if st.Zoom > 1 {
+			st.Zoom--
+		}
+	}
+	st.mu.Unlock()
+
+	canvas.Refresh(m.raster)
 }
 
 // ----- Geocoding -----
@@ -64,7 +111,6 @@ func geocodePostcode(ctx context.Context, pc string) (lon, lat float64, err erro
 	if err != nil {
 		return 0, 0, err
 	}
-	// Simplified the defer and error check
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			log.Printf("Warning: failed to close response body: %v", closeErr)
@@ -81,7 +127,7 @@ func geocodePostcode(ctx context.Context, pc string) (lon, lat float64, err erro
 	return dec.Result.Longitude, dec.Result.Latitude, nil
 }
 
-// ----- Police API (unchanged, with minor fix) -----
+// ----- Police API -----
 type policeCrime struct {
 	Category string `json:"category"`
 	Location struct {
@@ -90,9 +136,7 @@ type policeCrime struct {
 	} `json:"location"`
 }
 
-// latestYYYYMM is a fallback if the API doesn't respond
 func latestYYYYMM() string {
-	// The police API data is often 2-3 months behind. Let's default to -3.
 	y, m, _ := time.Now().AddDate(0, -3, 0).Date()
 	return fmt.Sprintf("%04d-%02d", y, int(m))
 }
@@ -117,10 +161,6 @@ func latestAvailableYYYYMM(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	// The API can return different formats, e.g., a full timestamp or just a date.
-	// try parsing them in order of preference.
-	// time.RFC3339-> "2006-01-02T15:04:05Z07:00"
-	// "2006-01-02"-> "YYYY-MM-DD"
 	possibleLayouts := []string{
 		time.RFC3339,
 		"2006-01-02",
@@ -132,17 +172,14 @@ func latestAvailableYYYYMM(ctx context.Context) (string, error) {
 	for _, layout := range possibleLayouts {
 		t, parseErr = time.Parse(layout, r.Date)
 		if parseErr == nil {
-			// Successfully parsed, break the loop.
 			break
 		}
 	}
 
-	// If after trying all layouts, still have an error, then fail.
 	if parseErr != nil {
 		return "", fmt.Errorf("could not parse date '%s': %w", r.Date, parseErr)
 	}
 
-	// Successfully parsed, return in the required YYYY-MM format.
 	return fmt.Sprintf("%04d-%02d", t.Year(), int(t.Month())), nil
 }
 
@@ -153,7 +190,6 @@ func fetchCrimes(ctx context.Context, lon, lat float64, yyyymm string) ([]CrimeP
 	if err != nil {
 		return nil, err
 	}
-	// CHANGED: Do not panic on close error.
 	defer func() {
 		if closeErr := resp.Body.Close(); closeErr != nil {
 			log.Printf("Warning: failed to close response body: %v", closeErr)
@@ -186,19 +222,20 @@ func drawCrimes(img *image.RGBA, w, h int, centerLon, centerLat float64, zoom in
 	}
 	cx, cy := w/2, h/2
 
-	// The number of pixels for 360 degrees of longitude at the equator for a given zoom level
-	// is 256 * (2^zoom). We use this to calculate a dynamic scaling factor.
-	pixelsPer360Deg := 256.0 * math.Pow(2, float64(zoom))
-	pixelsPerDegLon := pixelsPer360Deg / 360.0
-
-	// Latitude scaling is adjusted by the cosine of the latitude
-	pixelsPerDegLat := pixelsPerDegLon * math.Cos(centerLat*math.Pi/180)
+	// Get the exact floating-point tile coordinates of the map center
+	centerXTile, centerYTile := lonLatToTile(centerLon, centerLat, zoom)
 
 	for _, c := range crimes {
-		dxDeg := c.Lon - centerLon
-		dyDeg := c.Lat - centerLat
-		px := cx + int(dxDeg*pixelsPerDegLon)
-		py := cy - int(dyDeg*pixelsPerDegLat) // Y is inverted in screen coordinates
+		// Convert the crime point to its exact Web Mercator tile position
+		crimeXTile, crimeYTile := lonLatToTile(c.Lon, c.Lat, zoom)
+
+		// Calculate distance from center in tile units, then convert to pixels
+		dxPixels := (crimeXTile - centerXTile) * 256.0
+		dyPixels := (crimeYTile - centerYTile) * 256.0
+
+		// Center-relative projection
+		px := cx + int(math.Round(dxPixels))
+		py := cy + int(math.Round(dyPixels))
 
 		// Draw a small red circle for the crime
 		radius := 4
@@ -215,7 +252,6 @@ func drawCrimes(img *image.RGBA, w, h int, centerLon, centerLat float64, zoom in
 	}
 }
 
-// converts longitude and latitude to floating-point tile numbers at a given zoom.
 func lonLatToTile(lon, lat float64, zoom int) (x, y float64) {
 	latRad := lat * math.Pi / 180
 	n := math.Pow(2, float64(zoom))
@@ -224,11 +260,9 @@ func lonLatToTile(lon, lat float64, zoom int) (x, y float64) {
 	return x, y
 }
 
-func getTile(z, x, y int) image.Image {
-	// Create a unique key for this tile
+func getTile(z, x, y int, refreshCb func()) image.Image {
 	tileKey := fmt.Sprintf("%d/%d/%d", z, x, y)
 
-	// Check the cache first (with a read lock)
 	st.tileCache.mu.RLock()
 	img, found := st.tileCache.m[tileKey]
 	st.tileCache.mu.RUnlock()
@@ -236,43 +270,42 @@ func getTile(z, x, y int) image.Image {
 		return img
 	}
 
-	// Not in cache, download it.
-	// Set a valid User-Agent per OpenStreetMap policy.
-	url := fmt.Sprintf("https://tile.openstreetmap.org/%s.png", tileKey)
-	client := &http.Client{}
-	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent", "AronG-CrimeMapper/0.1")
+	if _, downloading := activeDownloads.LoadOrStore(tileKey, true); !downloading {
+		go func() {
+			defer activeDownloads.Delete(tileKey)
 
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("Failed to download tile %s: %v", tileKey, err)
-		return nil // Or return a placeholder "error" image
+			url := fmt.Sprintf("https://tile.openstreetmap.org/%s.png", tileKey)
+			client := &http.Client{Timeout: 5 * time.Second}
+			req, _ := http.NewRequest("GET", url, nil)
+			req.Header.Set("User-Agent", "AronG-CrimeMapper/0.1")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+
+			downloadedImg, _, err := image.Decode(resp.Body)
+			if err == nil {
+				st.tileCache.mu.Lock()
+				st.tileCache.m[tileKey] = downloadedImg
+				st.tileCache.mu.Unlock()
+
+				// Ensure UI refresh happens on the main Fyne thread
+				fyne.Do(refreshCb)
+			}
+		}()
 	}
-	defer func(Body io.ReadCloser) {
-		err := Body.Close()
-		if err != nil {
 
-		}
-	}(resp.Body)
-
-	img, _, err = image.Decode(resp.Body)
-	if err != nil {
-		log.Printf("Failed to decode tile %s: %v", tileKey, err)
-		return nil // Or return a placeholder "error" image
-	}
-
-	// Add the newly downloaded image to the cache (with a write lock)
-	st.tileCache.mu.Lock()
-	st.tileCache.m[tileKey] = img
-	st.tileCache.mu.Unlock()
-
-	return img
+	placeholder := image.NewRGBA(image.Rect(0, 0, 256, 256))
+	draw.Draw(placeholder, placeholder.Bounds(), &image.Uniform{C: color.RGBA{R: 230, G: 230, B: 230, A: 255}}, image.Point{}, draw.Src)
+	return placeholder
 }
 
 // ----- Main -----
 func main() {
 	st = AppState{
-		Zoom: 14, // A good default zoom level for a city
+		Zoom: 14,
 		tileCache: &TileCache{
 			m: make(map[string]image.Image),
 		},
@@ -282,13 +315,12 @@ func main() {
 	w := a.NewWindow("Community Data Visualiser")
 	w.Resize(fyne.NewSize(1100, 700))
 
-	// Map canvas first so closures can capture it
-	var mapCanvas *canvas.Raster
-	mapCanvas = canvas.NewRaster(func(w, h int) image.Image {
-		// Create the image we will draw on
+	interactiveMap := &mapWidget{}
+	interactiveMap.ExtendBaseWidget(interactiveMap)
+
+	interactiveMap.raster = canvas.NewRaster(func(w, h int) image.Image {
 		img := image.NewRGBA(image.Rect(0, 0, w, h))
 
-		// Get a read-lock on the state for consistent values during this draw cycle
 		st.mu.RLock()
 		zoom := st.Zoom
 		centerLon := st.CenterLon
@@ -297,48 +329,35 @@ func main() {
 		st.mu.RUnlock()
 
 		if centerLon == 0 && centerLat == 0 {
-			// Don't draw a map if no location is set. Just draw a message.
 			draw.Draw(img, img.Bounds(), &image.Uniform{C: color.RGBA{R: 240, G: 240, B: 240, A: 255}}, image.Point{}, draw.Src)
-			return img // Return early
+			return img
 		}
 
-		// 1. Convert our map's center Lon/Lat to a floating-point tile coordinate
 		centerXTile, centerYTile := lonLatToTile(centerLon, centerLat, zoom)
 
-		// 2. Calculate the top-left tile we need to start drawing from
-		// The center of the screen in pixels is (w/2, h/2)
-		// The center of the map in tile units is (centerXTile, centerYTile)
-		// We calculate the top-left of the screen in tile units
 		startTileX := centerXTile - (float64(w)/2)/256.0
 		startTileY := centerYTile - (float64(h)/2)/256.0
 
-		// 3. Loop to draw all visible tiles
-		// We iterate from the start tile to fill the whole screen width and height
-		for y := 0.0; y < float64(h); y += 256.0 {
-			for x := 0.0; x < float64(w); x += 256.0 {
-				// Calculate which tile (integer) corresponds to this screen pixel
+		for y := -256.0; y < float64(h)+256.0; y += 256.0 {
+			for x := -256.0; x < float64(w)+256.0; x += 256.0 {
 				tileX := int(math.Floor(startTileX + x/256.0))
 				tileY := int(math.Floor(startTileY + y/256.0))
 
-				// Fetch the tile from our cache/downloader
-				tileImg := getTile(zoom, tileX, tileY)
+				tileImg := getTile(zoom, tileX, tileY, func() {
+					canvas.Refresh(interactiveMap.raster)
+				})
+
 				if tileImg != nil {
-					// Calculate exactly where on our canvas to draw this tile
-					// This accounts for the fractional part of our startTile coordinates
 					drawX := int(math.Round((float64(tileX) - startTileX) * 256.0))
 					drawY := int(math.Round((float64(tileY) - startTileY) * 256.0))
 
-					// Draw the tile onto our main image
 					draw.Draw(img, image.Rect(drawX, drawY, drawX+256, drawY+256), tileImg, image.Point{}, draw.Src)
 				}
 			}
 		}
 
-		// 4. Draw overlays (crosshair and crimes) on top of the map
-		// The logic for drawing crimes now needs the zoom level to scale correctly
 		drawCrimes(img, w, h, centerLon, centerLat, zoom, crimes)
 
-		// Draw the crosshair
 		cx, cy := w/2, h/2
 		for dx := -8; dx <= 8; dx++ {
 			img.Set(cx+dx, cy, color.Black)
@@ -354,13 +373,11 @@ func main() {
 		return img
 	})
 
-	// Controls
 	postcode := widget.NewEntry()
 	postcode.SetPlaceHolder("e.g. SW1A 1AA")
 
-	statusLabel := widget.NewLabel("Enter a postcode to begin.") // REFACTORED: Add a status label
+	statusLabel := widget.NewLabel("Enter a postcode to begin.")
 
-	//  New function to handle crime fetching logic
 	updateCrimes := func() {
 		go func() {
 			st.mu.RLock()
@@ -369,23 +386,19 @@ func main() {
 			st.mu.RUnlock()
 
 			if lon == 0 && lat == 0 {
-				return // Don't fetch for the default location
+				return
 			}
 
 			fyne.Do(func() { statusLabel.SetText("Fetching crime data...") })
 
 			yyyymm, errMonth := latestAvailableYYYYMM(context.Background())
 			if errMonth != nil {
-				yyyymm = latestYYYYMM() // fallback
+				yyyymm = latestYYYYMM()
 			}
 
 			pts, err := fetchCrimes(context.Background(), lon, lat, yyyymm)
 			if err != nil {
 				fyne.Do(func() {
-					fyne.CurrentApp().SendNotification(&fyne.Notification{
-						Title:   "Crime fetch error",
-						Content: err.Error(),
-					})
 					statusLabel.SetText("Error fetching crime data.")
 				})
 				return
@@ -399,11 +412,7 @@ func main() {
 			fyne.Do(func() {
 				msg := fmt.Sprintf("%d crime points loaded for %s.", len(pts), yyyymm)
 				statusLabel.SetText(msg)
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Crimes loaded",
-					Content: msg,
-				})
-				canvas.Refresh(mapCanvas)
+				canvas.Refresh(interactiveMap.raster)
 			})
 		}()
 	}
@@ -413,14 +422,13 @@ func main() {
 			st.mu.Lock()
 			st.Crimes = nil
 			st.mu.Unlock()
-			canvas.Refresh(mapCanvas)
+			canvas.Refresh(interactiveMap.raster)
 			statusLabel.SetText("Crime overlay off.")
 			return
 		}
-		// If toggled on, just call function
 		updateCrimes()
 	})
-	showCrimes.Disable() // Start with the checkbox disabled
+	showCrimes.Disable()
 
 	goBtn := widget.NewButton("Go", func() {
 		fyne.Do(func() { statusLabel.SetText("Finding postcode...") })
@@ -428,10 +436,6 @@ func main() {
 			lon, lat, err := geocodePostcode(context.Background(), postcode.Text)
 			if err != nil {
 				fyne.Do(func() {
-					fyne.CurrentApp().SendNotification(&fyne.Notification{
-						Title:   "Geocode error",
-						Content: err.Error(),
-					})
 					statusLabel.SetText("Could not find postcode.")
 				})
 				return
@@ -442,16 +446,11 @@ func main() {
 			st.mu.Unlock()
 
 			fyne.Do(func() {
-				fyne.CurrentApp().SendNotification(&fyne.Notification{
-					Title:   "Centered",
-					Content: fmt.Sprintf("Lon: %.5f, Lat: %.5f", lon, lat),
-				})
-				showCrimes.Enable() // Enable checkbox now that there is a location
+				showCrimes.Enable()
 				statusLabel.SetText(fmt.Sprintf("Centered on Lon: %.3f, Lat: %.3f", lon, lat))
-				canvas.Refresh(mapCanvas)
+				canvas.Refresh(interactiveMap.raster)
 			})
 
-			// FIXED: If crimes are toggled on, refetch for new centre
 			if showCrimes.Checked {
 				updateCrimes()
 			}
@@ -460,12 +459,12 @@ func main() {
 
 	left := container.NewVBox(
 		widget.NewLabel("Find by postcode"),
-		container.NewBorder(nil, nil, nil, goBtn, postcode), // Put button next to entry
+		container.NewBorder(nil, nil, nil, goBtn, postcode),
 		widget.NewSeparator(),
 		showCrimes,
 		statusLabel,
 	)
 
-	w.SetContent(container.NewHSplit(left, mapCanvas))
+	w.SetContent(container.NewHSplit(left, interactiveMap))
 	w.ShowAndRun()
 }
